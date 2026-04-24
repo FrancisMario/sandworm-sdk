@@ -1,7 +1,7 @@
 {
   "name": "@sandworm-ai/sdk",
-  "version": "0.2.0",
-  "description": "AI observability SDK — tool call tracing, job lifecycle, error capture, MCP server instrumentation",
+  "version": "0.3.0",
+  "description": "AI observability SDK — decorators, tool tracing, job lifecycle, MCP server, agent proxy",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "files": ["dist"],

@@ -1,6 +1,6 @@
 # @sandworm-ai/sdk
 
-AI observability SDK — tool call tracing, job lifecycle, error capture, MCP server instrumentation.
+AI observability SDK — decorators, tool tracing, job lifecycle, built-in MCP server, agent proxy.
 
 ## Install
 
@@ -11,113 +11,144 @@ npm install @sandworm-ai/sdk
 ## Quick Start
 
 ```ts
-import { Sandworm } from '@sandworm-ai/sdk';
+import { Sandworm, expose, observe } from '@sandworm-ai/sdk';
 
-const sw = new Sandworm({
-  apiKey: 'sw_live_...',
-  serviceName: 'my-service',
-  endpoint: 'https://api.sandworm.lilicorp.dev',
-});
+class SearchService {
+  @expose('Search the documentation')
+  async search(args: { query: string }) {
+    return { results: ['result 1', 'result 2'] };
+  }
 
+  @observe()
+  async indexDocument(doc: { id: string; content: string }) {
+    // your indexing logic
+  }
+}
+
+const sw = new Sandworm({ apiKey: 'sw_live_...' });
+sw.scan(new SearchService());
 await sw.start();
 ```
 
-## Features
+That's it. `@expose` methods become MCP tools. `@observe` methods get automatic tracing. Everything registers with the platform on `start()`.
 
-### Wrap MCP Tools
+## Decorators
 
-Register tools with automatic tracing — every call records timing, status, and errors.
+### @expose — register as an MCP tool
 
 ```ts
-const search = sw.wrapTool('searchDocs', async (args: { query: string }) => {
-  return { results: [] };
-}, {
-  description: 'Search documentation',
-  tags: { domain: 'search' },
-});
+class OrderService {
+  @expose('Retry a failed order')
+  async retryOrder(args: { orderId: string }) {
+    return { success: true };
+  }
 
-const result = await search({ query: 'hello' });
+  @expose({ description: 'Cancel order', annotations: { destructiveHint: true } })
+  async cancelOrder(args: { orderId: string; reason: string }) {
+    return { cancelled: true };
+  }
+}
 ```
 
-### Wrap MCP Servers
+Tools are named `ClassName.methodName` (e.g. `OrderService.retryOrder`). Every call is traced with timing, status, and errors.
 
-Instrument an entire `@modelcontextprotocol/sdk` server. All tools registered after wrapping are automatically traced.
+### @observe — trace without exposing as a tool
+
+```ts
+class DataService {
+  @observe()
+  async fetchUser(id: string) {
+    return db.users.findOne(id);
+  }
+
+  @observe({ cache: 'redis' })
+  async getCachedConfig() {
+    return redis.get('config');
+  }
+}
+```
+
+### scan — discover decorated methods
+
+```ts
+const sw = new Sandworm({ apiKey: '...' });
+sw.scan(new OrderService(), new DataService());
+await sw.start();
+```
+
+## Imperative API
+
+For functional code or partial adoption — no decorators needed.
+
+### wrapTool
+
+```ts
+const search = sw.wrapTool('search', async (args: { query: string }) => {
+  return { results: [] };
+}, { description: 'Search docs' });
+
+await search({ query: 'hello' });
+```
+
+### observe (function)
+
+```ts
+const fetchUser = sw.observe('fetchUser', async (id: string) => {
+  return db.users.findOne(id);
+});
+```
+
+### wrapMcpServer
+
+Instrument an existing `@modelcontextprotocol/sdk` server:
 
 ```ts
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 
 const server = new McpServer({ name: 'my-server', version: '1.0.0' });
 sw.wrapMcpServer(server);
-
-// Tools registered after this are automatically traced
-server.tool('search', { query: z.string() }, async ({ query }) => {
-  return { content: [{ type: 'text', text: 'results...' }] };
-});
 ```
 
-### Observe Any Function
-
-Wrap any async function with timing/error capture — no MCP registration.
+### trackJob
 
 ```ts
-const fetchUser = sw.observe('fetchUser', async (id: string) => {
-  return db.users.findOne(id);
-}, { tags: { layer: 'data' } });
-
-const user = await fetchUser('usr_123');
-```
-
-### Track Job Lifecycle
-
-Monitor background jobs through their full lifecycle: start → complete/fail/retry.
-
-```ts
-const job = sw.trackJob('email-send', 'job_abc');
-
+const job = sw.trackJob('email-send');
 try {
   await sendEmail(payload);
   job.complete();
 } catch (err) {
-  job.fail(err, 1);
-  job.retry(2, 5000); // attempt 2, 5s delay
+  job.fail(err);
+  job.retry(2, 5000);
 }
 ```
 
-### Source Location Capture
+## Built-in MCP Server
 
-Every event automatically includes the source file and line number from your application code, giving agents precise context for debugging.
-
-### Custom Tags
-
-Attach metadata to any traced function or job for filtering and grouping in reports.
+Start a full MCP server from scanned `@expose` methods — no MCP SDK knowledge needed:
 
 ```ts
-sw.observe('processOrder', handler, {
-  tags: { queue: 'high-priority', region: 'us-east-1' },
-});
+const sw = new Sandworm({ apiKey: '...' });
+sw.scan(new OrderService(), new SearchService());
+await sw.startMcpServer();
 ```
+
+This starts a stdio MCP server with all exposed tools, plus telemetry and heartbeats.
 
 ## Configuration
 
 ```ts
 new Sandworm({
-  apiKey: 'sw_live_...',          // Required
-  serviceName: 'my-service',      // Required
-  endpoint: 'https://api.sandworm.lilicorp.dev', // Default
-  flushIntervalMs: 5000,          // Event flush interval (default: 5s)
-  heartbeatIntervalMs: 30000,     // Heartbeat interval (default: 30s)
-  bufferCapacity: 1000,           // Ring buffer size (default: 1000)
-  debug: false,                   // Debug logging (or set SANDWORM_DEBUG=1)
+  apiKey: 'sw_live_...',       // Required — everything else has defaults
+  serviceName: 'my-service',   // Default: "default"
+  endpoint: '...',             // Default: https://api.sandworm.lilicorp.dev
+  flushIntervalMs: 5000,       // Default: 5s
+  heartbeatIntervalMs: 30000,  // Default: 30s
+  bufferCapacity: 1000,        // Default: 1000
+  debug: false,                // Default: false (or SANDWORM_DEBUG=1)
 });
 ```
 
-## Lifecycle
-
-```ts
-await sw.start();      // Registers service + tools, starts heartbeat/flush loops
-// ... app runs ...
-await sw.shutdown();   // Flushes pending events, stops loops
-```
+Only `apiKey` is required. Everything else has sensible defaults.
 
 ## Event Types
 

@@ -1,5 +1,6 @@
 import { randomUUID } from 'crypto';
 import { Transport, type TransportConfig } from './transport';
+import { registry, type RegisteredTool, type ObservedMethod } from './registry';
 import type {
   ToolRegistration,
   MethodCallEvent,
@@ -10,13 +11,13 @@ import type {
   JobRetryEvent,
 } from './types';
 
-const SDK_VERSION = '0.2.0';
+const SDK_VERSION = '0.3.0';
 
 export interface SandwormConfig {
   /** API key (starts with sw_live_) */
   apiKey: string;
-  /** Name of this service / MCP server */
-  serviceName: string;
+  /** Service name (default: "default") */
+  serviceName?: string;
   /** Sandworm API endpoint */
   endpoint?: string;
   /** Flush interval in ms (default: 5000) */
@@ -25,7 +26,7 @@ export interface SandwormConfig {
   heartbeatIntervalMs?: number;
   /** Event buffer capacity (default: 1000) */
   bufferCapacity?: number;
-  /** Enable debug logging (default: false) */
+  /** Enable debug logging (default: false, or set SANDWORM_DEBUG=1) */
   debug?: boolean;
 }
 
@@ -51,23 +52,94 @@ export interface JobHandle {
 }
 
 export class Sandworm {
-  private readonly config: SandwormConfig;
+  private readonly config: Required<Pick<SandwormConfig, 'apiKey' | 'serviceName'>> & SandwormConfig;
   private readonly transport: Transport;
   private readonly tools: ToolRegistration[] = [];
+  private readonly instanceId = randomUUID();
   private started = false;
 
   constructor(config: SandwormConfig) {
-    this.config = config;
+    const serviceName = config.serviceName ?? 'default';
+    this.config = { ...config, serviceName };
+    const debug = config.debug ?? !!process.env.SANDWORM_DEBUG;
     const transportConfig: TransportConfig = {
       endpoint: config.endpoint ?? 'https://api.sandworm.lilicorp.dev',
       apiKey: config.apiKey,
-      serviceName: config.serviceName,
+      serviceName,
       flushIntervalMs: config.flushIntervalMs ?? 5_000,
       heartbeatIntervalMs: config.heartbeatIntervalMs ?? 30_000,
       bufferCapacity: config.bufferCapacity ?? 1_000,
-      debug: config.debug ?? !!process.env.SANDWORM_DEBUG,
+      debug,
     };
     this.transport = new Transport(transportConfig);
+
+    if (debug) {
+      console.log(`[sandworm] instance=${this.instanceId.slice(0, 8)} service="${serviceName}"`);
+    }
+  }
+
+  /**
+   * Scan class instances for @expose and @observe decorated methods.
+   * Exposed methods become MCP tools. Observed methods get automatic tracing.
+   */
+  scan(...instances: object[]): this {
+    for (const instance of instances) {
+      const result = registry.scan(instance);
+
+      // Wrap observed methods with telemetry
+      for (const observed of registry.getAllObserved()) {
+        this.wrapObservedMethod(observed);
+      }
+
+      // Collect tool registrations from exposed methods
+      for (const tool of registry.getAllTools()) {
+        if (!this.tools.find((t) => t.name === tool.name)) {
+          this.tools.push({
+            name: tool.name,
+            description: tool.description,
+            inputSchema: tool.inputSchema,
+            annotations: tool.annotations,
+          });
+          // Wrap exposed tool handlers with telemetry
+          this.wrapRegisteredTool(tool);
+        }
+      }
+    }
+    return this;
+  }
+
+  private wrapRegisteredTool(tool: RegisteredTool): void {
+    const original = tool.handler;
+    const self = this;
+    tool.handler = async function (args: any) {
+      const start = performance.now();
+      try {
+        const result = await original(args);
+        self.emitMethodCall(tool.name, performance.now() - start, 'ok');
+        return result;
+      } catch (err: any) {
+        self.emitMethodCall(tool.name, performance.now() - start, 'error', err?.message);
+        self.emitError(tool.name, err);
+        throw err;
+      }
+    };
+  }
+
+  private wrapObservedMethod(observed: ObservedMethod): void {
+    const original = observed.handler;
+    const self = this;
+    observed.handler = async function (...args: any[]) {
+      const start = performance.now();
+      try {
+        const result = await original(...args);
+        self.emitMethodCall(observed.name, performance.now() - start, 'ok', undefined, observed.tags);
+        return result;
+      } catch (err: any) {
+        self.emitMethodCall(observed.name, performance.now() - start, 'error', err?.message, observed.tags);
+        self.emitError(observed.name, err, observed.tags);
+        throw err;
+      }
+    };
   }
 
   /**
@@ -251,6 +323,22 @@ export class Sandworm {
     });
 
     this.transport.start();
+  }
+
+  /**
+   * Start the built-in MCP server (stdio transport).
+   * Also calls start() for telemetry if not already started.
+   * Requires @modelcontextprotocol/sdk as peer dep.
+   */
+  async startMcpServer(config?: { name?: string; version?: string; instructions?: string }): Promise<void> {
+    const { createMcpServer } = await import('./server');
+    const mcp = await createMcpServer({
+      name: config?.name ?? this.config.serviceName,
+      version: config?.version,
+      instructions: config?.instructions,
+    });
+    await this.start();
+    await mcp.start();
   }
 
   /**
