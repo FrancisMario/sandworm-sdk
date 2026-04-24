@@ -1,0 +1,38 @@
+{
+  "name": "sandworm",
+  "version": "0.1.0",
+  "description": "Observability SDK for MCP servers — tool call tracing, heartbeats, event streaming",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsc",
+    "clean": "rm -rf dist",
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": ["mcp", "observability", "ai", "tools", "telemetry", "sandworm"],
+  "author": "FrancisMario",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/FrancisMario/sandworm-sdk"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "peerDependencies": {
+    "@modelcontextprotocol/sdk": ">=1.0.0"
+  },
+  "peerDependenciesMeta": {
+    "@modelcontextprotocol/sdk": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.5.0",
+    "zod": "^3.23.0"
+  }
+}
