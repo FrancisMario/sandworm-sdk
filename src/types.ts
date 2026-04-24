@@ -23,7 +23,7 @@ export interface HeartbeatRequest {
 
 // Events
 
-export type EventType = 'method_call' | 'error';
+export type EventType = 'method_call' | 'error' | 'job_start' | 'job_complete' | 'job_fail' | 'job_retry';
 
 export interface BaseEvent {
   id: string;
@@ -39,6 +39,8 @@ export interface MethodCallEvent extends BaseEvent {
   durationMs: number;
   status: 'ok' | 'error';
   errorMessage?: string;
+  sourceFile?: string;
+  sourceLine?: number;
 }
 
 export interface ErrorEvent extends BaseEvent {
@@ -46,6 +48,44 @@ export interface ErrorEvent extends BaseEvent {
   message: string;
   stack?: string;
   method?: string;
+  sourceFile?: string;
+  sourceLine?: number;
 }
 
-export type TelemetryEvent = MethodCallEvent | ErrorEvent;
+export interface JobStartEvent extends BaseEvent {
+  type: 'job_start';
+  jobId: string;
+  jobType: string;
+}
+
+export interface JobCompleteEvent extends BaseEvent {
+  type: 'job_complete';
+  jobId: string;
+  jobType: string;
+  durationMs: number;
+}
+
+export interface JobFailEvent extends BaseEvent {
+  type: 'job_fail';
+  jobId: string;
+  jobType: string;
+  errorMessage: string;
+  errorStack?: string;
+  attemptNumber: number;
+}
+
+export interface JobRetryEvent extends BaseEvent {
+  type: 'job_retry';
+  jobId: string;
+  jobType: string;
+  attemptNumber: number;
+  retryDelayMs?: number;
+}
+
+export type TelemetryEvent =
+  | MethodCallEvent
+  | ErrorEvent
+  | JobStartEvent
+  | JobCompleteEvent
+  | JobFailEvent
+  | JobRetryEvent;
