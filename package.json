@@ -1,5 +1,5 @@
 {
-  "name": "sandworm",
+  "name": "@sandworm-ai/sdk",
   "version": "0.1.0",
   "description": "Observability SDK for MCP servers — tool call tracing, heartbeats, event streaming",
   "main": "dist/index.js",

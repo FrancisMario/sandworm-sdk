@@ -5,13 +5,13 @@ Observability SDK for MCP servers. Captures tool calls, errors, and performance 
 ## Install
 
 ```bash
-npm install sandworm
+npm install @sandworm-ai/sdk
 ```
 
 ## Quick Start
 
 ```ts
-import { Sandworm } from 'sandworm';
+import { Sandworm } from '@sandworm-ai/sdk';
 
 const sw = new Sandworm({
   apiKey: 'sw_live_...',
