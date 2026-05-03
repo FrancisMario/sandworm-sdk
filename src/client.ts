@@ -3,23 +3,29 @@ import { Transport, type TransportConfig } from './transport';
 import { registry, type RegisteredTool, type ObservedMethod } from './registry';
 import type {
   ToolRegistration,
+  PolicyHints,
   MethodCallEvent,
   ErrorEvent,
+  LogEvent,
+  LogLevel,
   JobStartEvent,
   JobCompleteEvent,
   JobFailEvent,
   JobRetryEvent,
 } from './types';
+import { ConsoleCapture, type CaptureLogsConfig } from './console-capture';
 
-const SDK_VERSION = '0.3.0';
+const SDK_VERSION = '0.4.0';
 
 export interface SandwormConfig {
   /** API key (starts with sw_live_) */
   apiKey: string;
-  /** Service name (default: "default") */
+  /** Service name — identifies this service to the platform */
   serviceName?: string;
-  /** Sandworm API endpoint */
+  /** Sandworm platform endpoint */
   endpoint?: string;
+  /** Transport mode: 'sse' (default) or 'ws' */
+  transport?: 'sse' | 'ws';
   /** Flush interval in ms (default: 5000) */
   flushIntervalMs?: number;
   /** Heartbeat interval in ms (default: 30000) */
@@ -28,6 +34,12 @@ export interface SandwormConfig {
   bufferCapacity?: number;
   /** Enable debug logging (default: false, or set SANDWORM_DEBUG=1) */
   debug?: boolean;
+  /**
+   * Capture console.log/warn/error/info/debug and stream as events.
+   * - `true` — capture all levels
+   * - `{ levels, passthrough }` — fine-grained control
+   */
+  captureLogs?: boolean | CaptureLogsConfig;
 }
 
 export interface ObserveOptions {
@@ -39,6 +51,7 @@ export interface WrapToolOptions {
   description?: string;
   inputSchema?: Record<string, unknown>;
   annotations?: Record<string, unknown>;
+  policy?: PolicyHints;
   tags?: Record<string, string>;
 }
 
@@ -56,6 +69,7 @@ export class Sandworm {
   private readonly transport: Transport;
   private readonly tools: ToolRegistration[] = [];
   private readonly instanceId = randomUUID();
+  private consoleCapture: ConsoleCapture | null = null;
   private started = false;
 
   constructor(config: SandwormConfig) {
@@ -63,15 +77,32 @@ export class Sandworm {
     this.config = { ...config, serviceName };
     const debug = config.debug ?? !!process.env.SANDWORM_DEBUG;
     const transportConfig: TransportConfig = {
-      endpoint: config.endpoint ?? 'https://api.sandworm.lilicorp.dev',
+      endpoint: config.endpoint ?? 'https://api.sandworm.dev',
       apiKey: config.apiKey,
       serviceName,
+      instanceId: this.instanceId,
       flushIntervalMs: config.flushIntervalMs ?? 5_000,
       heartbeatIntervalMs: config.heartbeatIntervalMs ?? 30_000,
       bufferCapacity: config.bufferCapacity ?? 1_000,
+      transport: config.transport ?? 'sse',
       debug,
     };
     this.transport = new Transport(transportConfig);
+
+    // Handle inbound tool_call requests from the platform
+    this.transport.on('tool_call', (msg: { id: string; tool: string; args: unknown }) => {
+      this.handleToolCall(msg.id, msg.tool, msg.args);
+    });
+
+    // Console log capture
+    if (config.captureLogs) {
+      const captureConfig: CaptureLogsConfig =
+        config.captureLogs === true ? {} : config.captureLogs;
+      this.consoleCapture = new ConsoleCapture(serviceName, captureConfig, (event) => {
+        this.transport.push(event);
+      });
+      this.consoleCapture.install();
+    }
 
     if (debug) {
       console.log(`[sandworm] instance=${this.instanceId.slice(0, 8)} service="${serviceName}"`);
@@ -80,11 +111,12 @@ export class Sandworm {
 
   /**
    * Scan class instances for @expose and @observe decorated methods.
-   * Exposed methods become MCP tools. Observed methods get automatic tracing.
+   * Exposed methods become tools available to agents via the platform.
+   * Observed methods get automatic tracing.
    */
   scan(...instances: object[]): this {
     for (const instance of instances) {
-      const result = registry.scan(instance);
+      registry.scan(instance);
 
       // Wrap observed methods with telemetry
       for (const observed of registry.getAllObserved()) {
@@ -99,52 +131,17 @@ export class Sandworm {
             description: tool.description,
             inputSchema: tool.inputSchema,
             annotations: tool.annotations,
+            policyHints: tool.policyHints,
           });
-          // Wrap exposed tool handlers with telemetry
-          this.wrapRegisteredTool(tool);
         }
       }
     }
     return this;
   }
 
-  private wrapRegisteredTool(tool: RegisteredTool): void {
-    const original = tool.handler;
-    const self = this;
-    tool.handler = async function (args: any) {
-      const start = performance.now();
-      try {
-        const result = await original(args);
-        self.emitMethodCall(tool.name, performance.now() - start, 'ok');
-        return result;
-      } catch (err: any) {
-        self.emitMethodCall(tool.name, performance.now() - start, 'error', err?.message);
-        self.emitError(tool.name, err);
-        throw err;
-      }
-    };
-  }
-
-  private wrapObservedMethod(observed: ObservedMethod): void {
-    const original = observed.handler;
-    const self = this;
-    observed.handler = async function (...args: any[]) {
-      const start = performance.now();
-      try {
-        const result = await original(...args);
-        self.emitMethodCall(observed.name, performance.now() - start, 'ok', undefined, observed.tags);
-        return result;
-      } catch (err: any) {
-        self.emitMethodCall(observed.name, performance.now() - start, 'error', err?.message, observed.tags);
-        self.emitError(observed.name, err, observed.tags);
-        throw err;
-      }
-    };
-  }
-
   /**
-   * Wrap a tool function with automatic tracing.
-   * Returns a new function with the same signature.
+   * Wrap a tool function — registers it as callable by agents.
+   * Returns a function you can also call directly (traced either way).
    */
   wrapTool<TArgs, TResult>(
     name: string,
@@ -156,6 +153,17 @@ export class Sandworm {
       description: opts?.description,
       inputSchema: opts?.inputSchema,
       annotations: opts?.annotations,
+      policyHints: opts?.policy,
+    });
+
+    // Register in registry so tool_call can find it
+    registry.register({
+      name,
+      description: opts?.description,
+      inputSchema: opts?.inputSchema,
+      annotations: opts?.annotations,
+      policyHints: opts?.policy,
+      handler: handler as any,
     });
 
     return async (args: TArgs): Promise<TResult> => {
@@ -174,7 +182,7 @@ export class Sandworm {
 
   /**
    * Wrap any async function with observability (timing, errors).
-   * Unlike wrapTool, this does NOT register as an MCP tool.
+   * Unlike wrapTool, this does NOT register as a tool callable by agents.
    */
   observe<TArgs extends any[], TResult>(
     name: string,
@@ -197,7 +205,6 @@ export class Sandworm {
 
   /**
    * Track a background job's lifecycle (start → complete/fail/retry).
-   * Returns a handle to mark state transitions.
    */
   trackJob(jobType: string, jobId?: string, tags?: Record<string, string>): JobHandle {
     const id = jobId ?? randomUUID();
@@ -263,91 +270,65 @@ export class Sandworm {
   }
 
   /**
-   * Wrap an MCP server instance to automatically trace all tool calls.
-   * Monkey-patches server.tool() to intercept registrations.
-   */
-  wrapMcpServer(server: any): void {
-    const originalTool = server.tool.bind(server);
-    const self = this;
-
-    server.tool = function (...toolArgs: any[]) {
-      // MCP SDK tool() signature: (name, description?, schema?, handler)
-      // or (name, schema?, handler) — find the handler (last function arg)
-      const handlerIdx = toolArgs.findIndex((a: any) => typeof a === 'function');
-      if (handlerIdx === -1) return originalTool(...toolArgs);
-
-      const name = toolArgs[0] as string;
-      const originalHandler = toolArgs[handlerIdx];
-
-      const wrappedHandler = async function (this: any, ...args: any[]) {
-        const start = performance.now();
-        try {
-          const result = await originalHandler.apply(this, args);
-          self.emitMethodCall(name, performance.now() - start, 'ok');
-          return result;
-        } catch (err: any) {
-          self.emitMethodCall(name, performance.now() - start, 'error', err?.message);
-          self.emitError(name, err);
-          throw err;
-        }
-      };
-
-      // Extract tool metadata for registration
-      const description = typeof toolArgs[1] === 'string' ? toolArgs[1] : undefined;
-      let inputSchema: Record<string, unknown> | undefined;
-      for (let i = 1; i < handlerIdx; i++) {
-        if (typeof toolArgs[i] === 'object' && toolArgs[i] !== null) {
-          inputSchema = toolArgs[i];
-          break;
-        }
-      }
-
-      self.tools.push({ name, description, inputSchema });
-
-      toolArgs[handlerIdx] = wrappedHandler;
-      return originalTool(...toolArgs);
-    };
-  }
-
-  /**
-   * Register with the ingest API and start heartbeat + flush loops.
+   * Connect to the Sandworm platform and begin accepting tool calls.
+   * Establishes a persistent WebSocket, registers tools, starts heartbeats.
    */
   async start(): Promise<void> {
     if (this.started) return;
     this.started = true;
-
-    await this.transport.register({
-      serviceName: this.config.serviceName,
-      sdkVersion: SDK_VERSION,
-      tools: this.tools,
-    });
-
-    this.transport.start();
+    await this.transport.connect(this.tools);
   }
 
   /**
-   * Start the built-in MCP server (stdio transport).
-   * Also calls start() for telemetry if not already started.
-   * Requires @modelcontextprotocol/sdk as peer dep.
-   */
-  async startMcpServer(config?: { name?: string; version?: string; instructions?: string }): Promise<void> {
-    const { createMcpServer } = await import('./server');
-    const mcp = await createMcpServer({
-      name: config?.name ?? this.config.serviceName,
-      version: config?.version,
-      instructions: config?.instructions,
-    });
-    await this.start();
-    await mcp.start();
-  }
-
-  /**
-   * Flush pending events and stop background loops.
+   * Flush pending events and disconnect.
    */
   async shutdown(): Promise<void> {
     if (!this.started) return;
     this.started = false;
+    this.consoleCapture?.uninstall();
     await this.transport.shutdown();
+  }
+
+  // ── Inbound tool execution ──────────────────────────────────────────
+
+  private async handleToolCall(callId: string, toolName: string, args: unknown): Promise<void> {
+    const tool = registry.getTool(toolName);
+    if (!tool) {
+      this.transport.sendToolResult(callId, null, `Unknown tool: ${toolName}`, 0);
+      return;
+    }
+
+    const start = performance.now();
+    try {
+      const result = await tool.handler(args);
+      const durationMs = Math.round((performance.now() - start) * 100) / 100;
+      this.emitMethodCall(toolName, durationMs, 'ok');
+      this.transport.sendToolResult(callId, result, undefined, durationMs);
+    } catch (err: any) {
+      const durationMs = Math.round((performance.now() - start) * 100) / 100;
+      this.emitMethodCall(toolName, durationMs, 'error', err?.message);
+      this.emitError(toolName, err);
+      this.transport.sendToolResult(callId, null, err?.message ?? 'Unknown error', durationMs);
+    }
+  }
+
+  // ── Internal helpers ────────────────────────────────────────────────
+
+  private wrapObservedMethod(observed: ObservedMethod): void {
+    const original = observed.handler;
+    const self = this;
+    observed.handler = async function (...args: any[]) {
+      const start = performance.now();
+      try {
+        const result = await original(...args);
+        self.emitMethodCall(observed.name, performance.now() - start, 'ok', undefined, observed.tags);
+        return result;
+      } catch (err: any) {
+        self.emitMethodCall(observed.name, performance.now() - start, 'error', err?.message, observed.tags);
+        self.emitError(observed.name, err, observed.tags);
+        throw err;
+      }
+    };
   }
 
   private emitMethodCall(method: string, durationMs: number, status: 'ok' | 'error', errorMessage?: string, tags?: Record<string, string>): void {
@@ -385,12 +366,10 @@ export class Sandworm {
     this.transport.push(event);
   }
 
-  /** Extract caller file/line from stack trace (skips SDK internals) */
   private captureSource(): { file: string; line: number } | undefined {
     const stack = new Error().stack;
     if (!stack) return undefined;
     const lines = stack.split('\n');
-    // Skip: Error, this method, emitMethodCall/emitError, the SDK wrapper
     for (const line of lines.slice(4)) {
       const match = line.match(/\((.+):(\d+):\d+\)/) ?? line.match(/at (.+):(\d+):\d+/);
       if (match && !match[1].includes('/sandworm-sdk/') && !match[1].includes('node_modules')) {

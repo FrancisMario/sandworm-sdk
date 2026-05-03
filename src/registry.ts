@@ -1,11 +1,12 @@
-import type { ToolRegistration } from './types';
-import { getExposeMetadata, getObserveMetadata, type ExposeMetadata, type ObserveMetadata } from './decorators';
+import type { ToolRegistration, PolicyHints } from './types';
+import { getExposeMetadata, getObserveMetadata, isDenied, type ExposeMetadata, type ObserveMetadata } from './decorators';
 
 export interface RegisteredTool {
   name: string;
   description?: string;
   inputSchema?: Record<string, unknown>;
   annotations?: Record<string, unknown>;
+  policyHints?: PolicyHints;
   handler: (args: any) => Promise<any>;
 }
 
@@ -46,6 +47,17 @@ class ToolRegistry {
       const method = (instance as any)[key];
       if (typeof method !== 'function') continue;
 
+      // @deny takes absolute precedence — method can never be exposed
+      if (isDenied(proto[key])) {
+        const exposeMeta = getExposeMetadata(proto[key]);
+        if (exposeMeta) {
+          throw new Error(
+            `[sandworm] "${className}.${key}" is marked @deny and @expose — this is a conflict. Remove one.`,
+          );
+        }
+        continue;
+      }
+
       const exposeMeta = getExposeMetadata(proto[key]);
       const observeMeta = getObserveMetadata(proto[key]);
 
@@ -56,6 +68,7 @@ class ToolRegistry {
           description: exposeMeta.description,
           inputSchema: exposeMeta.inputSchema,
           annotations: exposeMeta.annotations,
+          policyHints: exposeMeta.policy,
           handler: method.bind(instance),
         });
         exposedNames.push(toolName);
@@ -89,6 +102,7 @@ class ToolRegistry {
       description: t.description,
       inputSchema: t.inputSchema,
       annotations: t.annotations,
+      policyHints: t.policyHints,
     }));
   }
 

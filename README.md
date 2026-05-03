@@ -1,6 +1,20 @@
 # @sandworm-ai/sdk
 
-AI observability SDK — decorators, tool tracing, job lifecycle, built-in MCP server, agent proxy.
+SDK for connecting your services to the Sandworm platform. Expose tools to AI agents without opening ports or running servers.
+
+## Architecture
+
+```
+┌────────────┐   MCP (stdio/SSE)   ┌──────────────┐   WebSocket (outbound)   ┌─────────────────┐
+│   Agent    │◄────────────────────►│   Sandworm   │◄───────────────────────►│  Your Service   │
+│ (Claude,   │                      │   Platform   │                          │  (SDK, in VPC)  │
+│  GPT, etc) │                      │  = MCP server│                          │  no ports open  │
+└────────────┘                      └──────────────┘                          └─────────────────┘
+```
+
+- **Sandworm IS the MCP server.** Agents connect to us.
+- **Your service connects outbound** via WebSocket — works behind VPCs, NATs, firewalls.
+- **No ports to open**, no servers to run, no infrastructure to manage.
 
 ## Install
 
@@ -11,48 +25,84 @@ npm install @sandworm-ai/sdk
 ## Quick Start
 
 ```ts
-import { Sandworm, expose, observe } from '@sandworm-ai/sdk';
+import { Sandworm, expose, observe, TrustLevel, ApprovalRequirement } from '@sandworm-ai/sdk';
 
-class SearchService {
-  @expose('Search the documentation')
-  async search(args: { query: string }) {
-    return { results: ['result 1', 'result 2'] };
+class OrderService {
+  @expose({
+    description: 'Refund an order',
+    policy: {
+      minTrustLevel: TrustLevel.L2,
+      approval: ApprovalRequirement.Conditional,
+      cost: CostCategory.Medium,
+      reversible: false,
+    },
+  })
+  async refundOrder(args: { orderId: string; amount: number }) {
+    // your refund logic
+    return { success: true, refundId: 'ref_123' };
   }
 
   @observe()
-  async indexDocument(doc: { id: string; content: string }) {
-    // your indexing logic
+  async getOrder(id: string) {
+    return db.orders.findOne(id);
   }
 }
 
-const sw = new Sandworm({ apiKey: 'sw_live_...' });
-sw.scan(new SearchService());
-await sw.start();
+const sw = new Sandworm({
+  apiKey: 'sw_live_...',
+  serviceName: 'order-service',
+});
+
+sw.scan(new OrderService());
+await sw.start(); // connects to Sandworm, registers tools, begins accepting calls
 ```
 
-That's it. `@expose` methods become MCP tools. `@observe` methods get automatic tracing. Everything registers with the platform on `start()`.
+That's it. Your tools are now available to agents via the platform. The dashboard shows every call, enforces trust policies, and handles approvals.
+
+## How It Works
+
+1. `sw.start()` opens an outbound WebSocket to Sandworm
+2. SDK registers all `@expose`d tools with their policy hints
+3. When an agent calls a tool via MCP, Sandworm evaluates trust policy
+4. If approved, the call is forwarded to your SDK over the WebSocket
+5. SDK executes locally, returns the result
+6. Sandworm relays it back to the agent
+
+You never expose your service to the internet. All communication is initiated outbound.
 
 ## Decorators
 
-### @expose — register as an MCP tool
+### @expose — make a method callable by agents
 
 ```ts
-class OrderService {
-  @expose('Retry a failed order')
-  async retryOrder(args: { orderId: string }) {
+import { expose, TrustLevel, ApprovalRequirement, CostCategory } from '@sandworm-ai/sdk';
+
+class PaymentService {
+  @expose({
+    description: 'Process a refund',
+    policy: {
+      minTrustLevel: TrustLevel.L3,
+      approval: ApprovalRequirement.Human,
+      reversible: false,
+      cost: CostCategory.High,
+      tags: ['financial', 'destructive'],
+    },
+  })
+  async refund(args: { orderId: string; amount: number }) {
     return { success: true };
   }
 
-  @expose({ description: 'Cancel order', annotations: { destructiveHint: true } })
-  async cancelOrder(args: { orderId: string; reason: string }) {
-    return { cancelled: true };
+  // Simple form — just a description
+  @expose('Look up order status')
+  async getStatus(args: { orderId: string }) {
+    return { status: 'shipped' };
   }
 }
 ```
 
-Tools are named `ClassName.methodName` (e.g. `OrderService.retryOrder`). Every call is traced with timing, status, and errors.
+Policy hints are **defaults** the dashboard adopts on first registration. Dashboard policy is authoritative — ops can override.
 
-### @observe — trace without exposing as a tool
+### @observe — trace without exposing to agents
 
 ```ts
 class DataService {
@@ -61,36 +111,49 @@ class DataService {
     return db.users.findOne(id);
   }
 
-  @observe({ cache: 'redis' })
+  @observe({ tier: 'hot' })
   async getCachedConfig() {
     return redis.get('config');
   }
 }
 ```
 
-### scan — discover decorated methods
+Observed methods get automatic timing, error tracking, and source-location capture.
+
+### @deny — hard block from ever being exposed
 
 ```ts
-const sw = new Sandworm({ apiKey: '...' });
-sw.scan(new OrderService(), new DataService());
-await sw.start();
+class InternalService {
+  @deny()
+  async migrateDatabase() {
+    // can NEVER be exposed — even if someone adds @expose later, it throws
+  }
+}
+```
+
+### scan — discover all decorated methods
+
+```ts
+sw.scan(new OrderService(), new DataService(), new InternalService());
 ```
 
 ## Imperative API
 
-For functional code or partial adoption — no decorators needed.
-
-### wrapTool
+### wrapTool — register a tool without decorators
 
 ```ts
 const search = sw.wrapTool('search', async (args: { query: string }) => {
   return { results: [] };
-}, { description: 'Search docs' });
+}, {
+  description: 'Search documents',
+  policy: { minTrustLevel: TrustLevel.L1, approval: ApprovalRequirement.Auto },
+});
 
+// Can still call directly (traced):
 await search({ query: 'hello' });
 ```
 
-### observe (function)
+### observe — trace a function without exposing
 
 ```ts
 const fetchUser = sw.observe('fetchUser', async (id: string) => {
@@ -98,18 +161,7 @@ const fetchUser = sw.observe('fetchUser', async (id: string) => {
 });
 ```
 
-### wrapMcpServer
-
-Instrument an existing `@modelcontextprotocol/sdk` server:
-
-```ts
-import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-
-const server = new McpServer({ name: 'my-server', version: '1.0.0' });
-sw.wrapMcpServer(server);
-```
-
-### trackJob
+### trackJob — background job lifecycle
 
 ```ts
 const job = sw.trackJob('email-send');
@@ -118,37 +170,43 @@ try {
   job.complete();
 } catch (err) {
   job.fail(err);
-  job.retry(2, 5000);
 }
 ```
-
-## Built-in MCP Server
-
-Start a full MCP server from scanned `@expose` methods — no MCP SDK knowledge needed:
-
-```ts
-const sw = new Sandworm({ apiKey: '...' });
-sw.scan(new OrderService(), new SearchService());
-await sw.startMcpServer();
-```
-
-This starts a stdio MCP server with all exposed tools, plus telemetry and heartbeats.
 
 ## Configuration
 
 ```ts
 new Sandworm({
-  apiKey: 'sw_live_...',       // Required — everything else has defaults
-  serviceName: 'my-service',   // Default: "default"
-  endpoint: '...',             // Default: https://api.sandworm.lilicorp.dev
-  flushIntervalMs: 5000,       // Default: 5s
-  heartbeatIntervalMs: 30000,  // Default: 30s
-  bufferCapacity: 1000,        // Default: 1000
-  debug: false,                // Default: false (or SANDWORM_DEBUG=1)
+  apiKey: 'sw_live_...',          // Required
+  serviceName: 'my-service',      // Identifies this service (default: "default")
+  endpoint: 'https://api.sandworm.dev',  // Platform endpoint
+  flushIntervalMs: 5000,          // Telemetry flush interval
+  heartbeatIntervalMs: 30000,     // Keep-alive interval
+  bufferCapacity: 1000,           // Max buffered events before flush
+  debug: false,                   // Enable debug logging (or SANDWORM_DEBUG=1)
 });
 ```
 
-Only `apiKey` is required. Everything else has sensible defaults.
+## Policy Hint Enums
+
+```ts
+import { TrustLevel, ApprovalRequirement, CostCategory } from '@sandworm-ai/sdk';
+
+TrustLevel.L0  // No trust — fully blocked
+TrustLevel.L1  // Minimal — read-only, no side effects
+TrustLevel.L2  // Low — side effects with guardrails
+TrustLevel.L3  // Medium — significant actions, may need approval
+TrustLevel.L4  // High — full autonomy
+
+ApprovalRequirement.Auto         // Platform decides based on trust level
+ApprovalRequirement.Human        // Always requires human approval
+ApprovalRequirement.Conditional  // Approval based on runtime conditions
+
+CostCategory.Free    // No cost
+CostCategory.Low     // < $1
+CostCategory.Medium  // $1–$100
+CostCategory.High    // > $100
+```
 
 ## Event Types
 

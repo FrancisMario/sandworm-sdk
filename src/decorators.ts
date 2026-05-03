@@ -1,14 +1,23 @@
-import type { ToolRegistration } from './types';
+import type { ToolRegistration, PolicyHints } from './types';
 
 const EXPOSE_KEY = Symbol.for('sandworm:expose');
 const OBSERVE_KEY = Symbol.for('sandworm:observe');
+const DENY_KEY = Symbol.for('sandworm:deny');
 
 // ── Decorator metadata ──────────────────────────────────────────
+
+export interface ExposeConfig {
+  description?: string;
+  inputSchema?: Record<string, unknown>;
+  annotations?: Record<string, unknown>;
+  policy?: PolicyHints;
+}
 
 export interface ExposeMetadata {
   description?: string;
   inputSchema?: Record<string, unknown>;
   annotations?: Record<string, unknown>;
+  policy?: PolicyHints;
   propertyKey: string;
 }
 
@@ -19,7 +28,7 @@ export interface ObserveMetadata {
 
 // ── @expose decorator ───────────────────────────────────────────
 
-export function expose(descriptionOrConfig?: string | { description?: string; inputSchema?: Record<string, unknown>; annotations?: Record<string, unknown> }): MethodDecorator {
+export function expose(descriptionOrConfig?: string | ExposeConfig): MethodDecorator {
   return function (_target, propertyKey, descriptor: PropertyDescriptor) {
     const config = typeof descriptionOrConfig === 'string'
       ? { description: descriptionOrConfig }
@@ -29,6 +38,7 @@ export function expose(descriptionOrConfig?: string | { description?: string; in
       description: config.description,
       inputSchema: config.inputSchema,
       annotations: config.annotations,
+      policy: config.policy,
       propertyKey: String(propertyKey),
     };
 
@@ -55,6 +65,15 @@ export function observe(tags?: Record<string, string>): MethodDecorator {
   };
 }
 
+// ── @deny decorator ─────────────────────────────────────────────
+
+export function deny(): MethodDecorator {
+  return function (_target, _propertyKey, descriptor: PropertyDescriptor) {
+    (descriptor.value as any)[DENY_KEY] = true;
+    return descriptor;
+  };
+}
+
 // ── Metadata readers ────────────────────────────────────────────
 
 export function getExposeMetadata(fn: Function): ExposeMetadata | undefined {
@@ -65,4 +84,8 @@ export function getObserveMetadata(fn: Function): ObserveMetadata | undefined {
   return (fn as any)[OBSERVE_KEY];
 }
 
-export { EXPOSE_KEY, OBSERVE_KEY };
+export function isDenied(fn: Function): boolean {
+  return (fn as any)[DENY_KEY] === true;
+}
+
+export { EXPOSE_KEY, OBSERVE_KEY, DENY_KEY };
