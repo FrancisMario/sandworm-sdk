@@ -1,7 +1,7 @@
 {
   "name": "@sandworm-ai/sdk",
   "version": "0.3.0",
-  "description": "AI observability SDK — decorators, tool tracing, job lifecycle, MCP server, agent proxy",
+  "description": "Node.js SDK for the Sandworm platform. Expose methods as agent-callable tools via decorators, with tracing and policy hints.",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "files": ["dist"],

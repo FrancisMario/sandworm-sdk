@@ -1,20 +1,6 @@
 # @sandworm-ai/sdk
 
-SDK for connecting your services to the Sandworm platform. Expose tools to AI agents without opening ports or running servers.
-
-## Architecture
-
-```
-┌────────────┐   MCP (stdio/SSE)   ┌──────────────┐   WebSocket (outbound)   ┌─────────────────┐
-│   Agent    │◄────────────────────►│   Sandworm   │◄───────────────────────►│  Your Service   │
-│ (Claude,   │                      │   Platform   │                          │  (SDK, in VPC)  │
-│  GPT, etc) │                      │  = MCP server│                          │  no ports open  │
-└────────────┘                      └──────────────┘                          └─────────────────┘
-```
-
-- **Sandworm IS the MCP server.** Agents connect to us.
-- **Your service connects outbound** via WebSocket — works behind VPCs, NATs, firewalls.
-- **No ports to open**, no servers to run, no infrastructure to manage.
+Node.js SDK for the Sandworm platform. Connects your services to the control plane via outbound WebSocket — decorated methods become tools that agents can call through MCP.
 
 ## Install
 
@@ -22,10 +8,24 @@ SDK for connecting your services to the Sandworm platform. Expose tools to AI ag
 npm install @sandworm-ai/sdk
 ```
 
+## Architecture
+
+```
+┌────────────┐   MCP (stdio/SSE)   ┌──────────────┐   WebSocket (outbound)   ┌─────────────────┐
+│   Agent    │◄────────────────────►│   Sandworm   │◄───────────────────────►│  Your Service   │
+│ (Claude,   │                      │   Platform   │                          │  (SDK, in VPC)  │
+│  GPT, etc) │                      │  = MCP server│                          │                 │
+└────────────┘                      └──────────────┘                          └─────────────────┘
+```
+
+- The platform acts as the MCP server. Agents connect to it.
+- Your service connects outbound via WebSocket. Works behind NAT/firewalls — no open ports needed.
+- Tool calls are forwarded from the platform to your SDK over the socket.
+
 ## Quick Start
 
 ```ts
-import { Sandworm, expose, observe, TrustLevel, ApprovalRequirement } from '@sandworm-ai/sdk';
+import { Sandworm, expose, observe, TrustLevel, ApprovalRequirement, CostCategory } from '@sandworm-ai/sdk';
 
 class OrderService {
   @expose({
@@ -38,7 +38,6 @@ class OrderService {
     },
   })
   async refundOrder(args: { orderId: string; amount: number }) {
-    // your refund logic
     return { success: true, refundId: 'ref_123' };
   }
 
@@ -54,84 +53,76 @@ const sw = new Sandworm({
 });
 
 sw.scan(new OrderService());
-await sw.start(); // connects to Sandworm, registers tools, begins accepting calls
+await sw.start();
 ```
-
-That's it. Your tools are now available to agents via the platform. The dashboard shows every call, enforces trust policies, and handles approvals.
 
 ## How It Works
 
-1. `sw.start()` opens an outbound WebSocket to Sandworm
-2. SDK registers all `@expose`d tools with their policy hints
-3. When an agent calls a tool via MCP, Sandworm evaluates trust policy
+1. `sw.start()` opens an outbound WebSocket to the platform
+2. The SDK registers all `@expose`d methods with their schemas and policy hints
+3. When an agent calls a tool via MCP, the platform evaluates trust policy
 4. If approved, the call is forwarded to your SDK over the WebSocket
-5. SDK executes locally, returns the result
-6. Sandworm relays it back to the agent
-
-You never expose your service to the internet. All communication is initiated outbound.
+5. The SDK executes locally and returns the result
+6. The platform relays it back to the agent
 
 ## Decorators
 
-### @expose — make a method callable by agents
+### @expose
+
+Marks a method as callable by agents. Accepts a description string or a config object with policy hints.
 
 ```ts
-import { expose, TrustLevel, ApprovalRequirement, CostCategory } from '@sandworm-ai/sdk';
+@expose({
+  description: 'Process a refund',
+  policy: {
+    minTrustLevel: TrustLevel.L3,
+    approval: ApprovalRequirement.Human,
+    reversible: false,
+    cost: CostCategory.High,
+    tags: ['financial', 'destructive'],
+  },
+})
+async refund(args: { orderId: string; amount: number }) {
+  return { success: true };
+}
 
-class PaymentService {
-  @expose({
-    description: 'Process a refund',
-    policy: {
-      minTrustLevel: TrustLevel.L3,
-      approval: ApprovalRequirement.Human,
-      reversible: false,
-      cost: CostCategory.High,
-      tags: ['financial', 'destructive'],
-    },
-  })
-  async refund(args: { orderId: string; amount: number }) {
-    return { success: true };
-  }
-
-  // Simple form — just a description
-  @expose('Look up order status')
-  async getStatus(args: { orderId: string }) {
-    return { status: 'shipped' };
-  }
+// Short form
+@expose('Look up order status')
+async getStatus(args: { orderId: string }) {
+  return { status: 'shipped' };
 }
 ```
 
-Policy hints are **defaults** the dashboard adopts on first registration. Dashboard policy is authoritative — ops can override.
+Policy hints are defaults adopted on first registration. Dashboard policy is authoritative — can be overridden by ops.
 
-### @observe — trace without exposing to agents
+### @observe
+
+Traces a method (timing, errors, source location) without exposing it to agents.
 
 ```ts
-class DataService {
-  @observe()
-  async fetchUser(id: string) {
-    return db.users.findOne(id);
-  }
+@observe()
+async fetchUser(id: string) {
+  return db.users.findOne(id);
+}
 
-  @observe({ tier: 'hot' })
-  async getCachedConfig() {
-    return redis.get('config');
-  }
+@observe({ tier: 'hot' })
+async getCachedConfig() {
+  return redis.get('config');
 }
 ```
 
-Observed methods get automatic timing, error tracking, and source-location capture.
+### @deny
 
-### @deny — hard block from ever being exposed
+Prevents a method from ever being exposed, even if `@expose` is added later.
 
 ```ts
-class InternalService {
-  @deny()
-  async migrateDatabase() {
-    // can NEVER be exposed — even if someone adds @expose later, it throws
-  }
-}
+@deny()
+async migrateDatabase() { ... }
 ```
 
-### scan — discover all decorated methods
+### scan
+
+Discovers all decorated methods on one or more class instances.
 
 ```ts
 sw.scan(new OrderService(), new DataService(), new InternalService());
@@ -139,7 +130,9 @@ sw.scan(new OrderService(), new DataService(), new InternalService());
 
 ## Imperative API
 
-### wrapTool — register a tool without decorators
+### wrapTool
+
+Register a tool without decorators:
 
 ```ts
 const search = sw.wrapTool('search', async (args: { query: string }) => {
@@ -149,11 +142,12 @@ const search = sw.wrapTool('search', async (args: { query: string }) => {
   policy: { minTrustLevel: TrustLevel.L1, approval: ApprovalRequirement.Auto },
 });
 
-// Can still call directly (traced):
-await search({ query: 'hello' });
+await search({ query: 'hello' }); // direct calls are also traced
 ```
 
-### observe — trace a function without exposing
+### observe (function)
+
+Trace a function without exposing it:
 
 ```ts
 const fetchUser = sw.observe('fetchUser', async (id: string) => {
@@ -161,7 +155,9 @@ const fetchUser = sw.observe('fetchUser', async (id: string) => {
 });
 ```
 
-### trackJob — background job lifecycle
+### trackJob
+
+Track background job lifecycle:
 
 ```ts
 const job = sw.trackJob('email-send');
@@ -179,24 +175,22 @@ try {
 new Sandworm({
   apiKey: 'sw_live_...',          // Required
   serviceName: 'my-service',      // Identifies this service (default: "default")
-  endpoint: 'https://api.sandworm.dev',  // Platform endpoint
+  endpoint: 'https://...',        // Platform endpoint
   flushIntervalMs: 5000,          // Telemetry flush interval
   heartbeatIntervalMs: 30000,     // Keep-alive interval
   bufferCapacity: 1000,           // Max buffered events before flush
-  debug: false,                   // Enable debug logging (or SANDWORM_DEBUG=1)
+  debug: false,                   // Debug logging (or SANDWORM_DEBUG=1)
 });
 ```
 
-## Policy Hint Enums
+## Enums
 
 ```ts
-import { TrustLevel, ApprovalRequirement, CostCategory } from '@sandworm-ai/sdk';
-
-TrustLevel.L0  // No trust — fully blocked
-TrustLevel.L1  // Minimal — read-only, no side effects
-TrustLevel.L2  // Low — side effects with guardrails
-TrustLevel.L3  // Medium — significant actions, may need approval
-TrustLevel.L4  // High — full autonomy
+TrustLevel.L0  // Blocked
+TrustLevel.L1  // Read-only, no side effects
+TrustLevel.L2  // Side effects with guardrails
+TrustLevel.L3  // Significant actions, may need approval
+TrustLevel.L4  // Full autonomy
 
 ApprovalRequirement.Auto         // Platform decides based on trust level
 ApprovalRequirement.Human        // Always requires human approval
@@ -215,6 +209,10 @@ CostCategory.High    // > $100
 | `method_call` | Tool/function call with timing and status |
 | `error` | Error with stack trace and source location |
 | `job_start` | Background job started |
-| `job_complete` | Job finished successfully with duration |
-| `job_fail` | Job failed with error and attempt number |
+| `job_complete` | Job finished with duration |
+| `job_fail` | Job failed with error and attempt count |
 | `job_retry` | Job scheduled for retry with delay |
+
+## License
+
+MIT
