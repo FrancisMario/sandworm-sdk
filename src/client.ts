@@ -77,7 +77,7 @@ export class Sandworm {
     this.config = { ...config, serviceName };
     const debug = config.debug ?? !!process.env.SANDWORM_DEBUG;
     const transportConfig: TransportConfig = {
-      endpoint: config.endpoint ?? 'https://api.sandworm.dev',
+      endpoint: config.endpoint ?? 'https://api.sandworm.lilicorp.dev',
       apiKey: config.apiKey,
       serviceName,
       instanceId: this.instanceId,
