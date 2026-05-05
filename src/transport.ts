@@ -388,7 +388,9 @@ export class Transport extends EventEmitter {
     this.reconnectAttempts++;
     const delay = Math.min(1000 * 2 ** this.reconnectAttempts, this.maxReconnectDelay);
     this.log(`reconnecting in ${delay}ms (attempt ${this.reconnectAttempts})`);
+    this.emit('disconnected', { attempt: this.reconnectAttempts, nextRetryMs: delay });
     this.reconnectTimer = setTimeout(() => {
+      this.emit('reconnecting', { attempt: this.reconnectAttempts });
       if (this.config.transport === 'ws') {
         this.connectWs().catch((err) => {
           this.log(`WS reconnect failed: ${err.message}`);
@@ -419,7 +421,12 @@ export class Transport extends EventEmitter {
       clearTimeout(timer);
 
       if (!res.ok) {
-        throw new Error(`Sandworm API ${res.status}: ${path}`);
+        const hint = res.status === 401
+          ? ' — check your API key is valid and not revoked'
+          : res.status === 404
+          ? ' — check your endpoint URL is correct'
+          : '';
+        throw new Error(`Sandworm API ${res.status}: ${path}${hint}`);
       }
 
       const text = await res.text();

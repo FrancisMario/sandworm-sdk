@@ -74,11 +74,24 @@ export class Sandworm {
 
   constructor(config: SandwormConfig) {
     const serviceName = config.serviceName ?? 'default';
-    this.config = { ...config, serviceName };
+    const apiKey = config.apiKey || process.env.SANDWORM_API_KEY;
+    if (!apiKey) {
+      throw new Error(
+        '[sandworm] Missing API key. Pass `apiKey` in config or set the SANDWORM_API_KEY environment variable.\n' +
+        '  → Get a key at https://app.sandworm.lilicorp.dev'
+      );
+    }
+    if (!apiKey.startsWith('sw_')) {
+      throw new Error(
+        `[sandworm] Invalid API key format: expected key starting with "sw_", got "${apiKey.slice(0, 6)}…"\n` +
+        '  → Keys are created in the Sandworm dashboard under Project → API Keys'
+      );
+    }
+    this.config = { ...config, apiKey, serviceName };
     const debug = config.debug ?? !!process.env.SANDWORM_DEBUG;
     const transportConfig: TransportConfig = {
       endpoint: config.endpoint ?? 'https://api.sandworm.lilicorp.dev',
-      apiKey: config.apiKey,
+      apiKey,
       serviceName,
       instanceId: this.instanceId,
       flushIntervalMs: config.flushIntervalMs ?? 5_000,
